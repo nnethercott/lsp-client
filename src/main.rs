@@ -9,19 +9,13 @@ use std::{
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdout, Command},
+    process::{Child, ChildStdin, ChildStdout, Command},
+    sync::Mutex,
 };
 use tower_lsp::jsonrpc;
 
-// questions:
-// - what is a piped stdin/stdout ?
-
 // TODO:
-// - async file io/requests
 // - handle dispatching/request multiplexing
-
-// NOTE: assumptions
-// - ordering on the request ids
 
 fn get_contents(path: impl AsRef<Path>) -> io::Result<String> {
     let mut contents = String::new();
@@ -62,7 +56,8 @@ macro_rules! lsp {
 
 struct LspClient {
     pub proc: Child,
-    reader: BufReader<ChildStdout>,
+    stdout: Mutex<BufReader<ChildStdout>>,
+    stdin: Mutex<ChildStdin>,
 }
 
 impl LspClient {
@@ -71,50 +66,48 @@ impl LspClient {
 
         let mut lsp_handle = Command::new(&lsp.name)
             .args(lsp.args.as_ref().unwrap_or(&vec![]))
-            .stdin(Stdio::piped()) // sending requests
-            .stdout(Stdio::piped()) // receiving results
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .spawn()?;
 
         let stdout = lsp_handle.stdout.take().unwrap();
+        let stdin = lsp_handle.stdin.take().unwrap();
 
         Ok(Self {
             proc: lsp_handle,
-            reader: BufReader::new(stdout),
+            stdin: Mutex::new(stdin),
+            stdout: Mutex::new(BufReader::new(stdout)),
         })
     }
 
     pub async fn init(&mut self, path: &str) -> Result<()> {
-        // lsp init handshake
-        let init = jsonrpc::Request::build("initialize")
-            .id(0)
-            .params(json!({
-                "processId": process::id(),
-                "rootPath": path,
-                "capabilities": {},
-            }))
-            .finish();
+        self.request_or_notify(
+            jsonrpc::Request::build("initialize")
+                .id(0)
+                .params(json!({
+                    "processId": process::id(),
+                    "rootPath": path,
+                    "capabilities": {},
+                }))
+                .finish(),
+        )
+        .await?;
 
-        self.request_or_notify(init).await?;
-
-        // notify initalize successful
-        let init_confirm_notif = jsonrpc::Request::build("initialized").finish();
-        self.request_or_notify(init_confirm_notif).await?;
+        // ok; initialized
+        self.request_or_notify(jsonrpc::Request::build("initialized").finish())
+            .await?;
 
         Ok(())
     }
 
-    async fn send(&mut self, msg: &str) -> io::Result<usize> {
+    async fn send(&self, msg: &str) -> io::Result<usize> {
         let msg = format!("Content-Length: {}\r\n\r\n{}", msg.len(), msg);
-        self.proc
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write(msg.as_bytes())
-            .await
+        self.stdin.lock().await.write(msg.as_bytes()).await
     }
 
     // the external reader steps lsp subproc stdout read state
-    async fn recv(&mut self) -> Result<Value> {
+    async fn recv(&self) -> Result<Value> {
+        let mut stdout_guard = self.stdout.lock().await;
         let mut buf = String::new();
 
         let mut size: usize = 0;
@@ -122,12 +115,10 @@ impl LspClient {
         // process headers
         loop {
             buf.clear();
-            self.reader.read_line(&mut buf).await?;
-
+            stdout_guard.read_line(&mut buf).await?;
             if buf.trim().is_empty() {
                 break;
             }
-
             if buf.contains("Content-Length") {
                 let (_, l) = buf.split_once("Content-Length: ").unwrap();
                 size = l.trim().parse().unwrap();
@@ -136,14 +127,16 @@ impl LspClient {
 
         let mut response = vec![];
         response.resize(size, 0);
-        self.reader.read_exact(&mut response).await?;
+        stdout_guard.read_exact(&mut response).await?;
+
+        drop(stdout_guard);
 
         let resp = serde_json::from_slice::<Value>(&response)?;
         Ok(resp)
     }
 
     pub async fn request_or_notify(
-        &mut self,
+        &self,
         req: jsonrpc::Request,
     ) -> Result<Option<jsonrpc::Response>> {
         // self.send then read from buffer, skipping notifs and asserting id's are consistent
@@ -225,8 +218,28 @@ async fn main() -> Result<()> {
         }))
         .finish();
 
-    let resp = client.request_or_notify(hover).await?;
-    dbg!(resp.unwrap());
+    let hover2 = jsonrpc::Request::build("textDocument/references")
+        .id(2)
+        .params(json!({
+            "textDocument": {
+                "uri": doc_uri,
+            },
+            "position": {
+                "line": 4,   // <-- new line
+                "character": 5,
+            },
+            "context": {
+                "includeDeclaration": true,
+            }
+        }))
+        .finish();
+
+    let (resp, resp2) = tokio::join!(
+        client.request_or_notify(hover),
+        client.request_or_notify(hover2)
+    );
+    dbg!(resp);
+    dbg!(resp2);
 
     client.proc.kill().await.expect("failed to kill subproc");
 
