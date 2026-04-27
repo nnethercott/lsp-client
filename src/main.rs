@@ -67,7 +67,6 @@ struct LspClient {
 
 impl LspClient {
     pub fn new(lsp: LspServer) -> Result<Self> {
-        // launch subproc and declare init
         dbg!(&lsp);
 
         let mut lsp_handle = Command::new(&lsp.name)
@@ -76,7 +75,6 @@ impl LspClient {
             .stdout(Stdio::piped()) // receiving results
             .spawn()?;
 
-        // crazyness
         let stdout = lsp_handle.stdout.take().unwrap();
 
         Ok(Self {
@@ -96,13 +94,11 @@ impl LspClient {
             }))
             .finish();
 
-        // fixme: replace with self.request
-        self.send(&init.to_string()).await?;
-        self.recv().await?;
+        self.request_or_notify(init).await?;
 
         // notify initalize successful
         let init_confirm_notif = jsonrpc::Request::build("initialized").finish();
-        self.send(&init_confirm_notif.to_string()).await?;
+        self.request_or_notify(init_confirm_notif).await?;
 
         Ok(())
     }
@@ -146,7 +142,10 @@ impl LspClient {
         Ok(resp)
     }
 
-    pub async fn request(&mut self, req: jsonrpc::Request) -> Result<Option<jsonrpc::Response>> {
+    pub async fn request_or_notify(
+        &mut self,
+        req: jsonrpc::Request,
+    ) -> Result<Option<jsonrpc::Response>> {
         // self.send then read from buffer, skipping notifs and asserting id's are consistent
         self.send(&req.to_string()).await?;
 
@@ -208,7 +207,7 @@ async fn main() -> Result<()> {
         }))
         .finish();
 
-    client.request(did_open).await?;
+    client.request_or_notify(did_open).await?;
 
     let hover = jsonrpc::Request::build("textDocument/references")
         .id(1)
@@ -226,7 +225,7 @@ async fn main() -> Result<()> {
         }))
         .finish();
 
-    let resp = client.request(hover).await?;
+    let resp = client.request_or_notify(hover).await?;
     dbg!(resp.unwrap());
 
     client.proc.kill().await.expect("failed to kill subproc");
