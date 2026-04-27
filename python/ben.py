@@ -1,0 +1,2 @@
+from nate import foo
+
