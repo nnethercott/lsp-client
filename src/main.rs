@@ -1,14 +1,17 @@
 use std::{
     env::current_dir,
     fs::File,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, Read},
     path::Path,
-    process::{self, Child, ChildStdout, Command, Stdio},
-    str::FromStr,
+    process::{self, Stdio},
 };
 
 use serde_json::{json, Value};
-use tower_lsp::jsonrpc::{self, Request};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdout, Command},
+};
+use tower_lsp::jsonrpc;
 
 // questions:
 // - what is a piped stdin/stdout ?
@@ -82,7 +85,7 @@ impl LspClient {
         })
     }
 
-    pub fn init(&mut self, path: &str) -> Result<()> {
+    pub async fn init(&mut self, path: &str) -> Result<()> {
         // lsp init handshake
         let init = jsonrpc::Request::build("initialize")
             .id(0)
@@ -94,23 +97,28 @@ impl LspClient {
             .finish();
 
         // fixme: replace with self.request
-        self.send(&init.to_string())?;
-        self.recv()?;
+        self.send(&init.to_string()).await?;
+        self.recv().await?;
 
         // notify initalize successful
         let init_confirm_notif = jsonrpc::Request::build("initialized").finish();
-        self.send(&init_confirm_notif.to_string())?;
+        self.send(&init_confirm_notif.to_string()).await?;
 
         Ok(())
     }
 
-    fn send(&mut self, msg: &str) -> io::Result<()> {
+    async fn send(&mut self, msg: &str) -> io::Result<usize> {
         let msg = format!("Content-Length: {}\r\n\r\n{}", msg.len(), msg);
-        write!(self.proc.stdin.as_mut().unwrap(), "{}", msg)
+        self.proc
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write(msg.as_bytes())
+            .await
     }
 
     // the external reader steps lsp subproc stdout read state
-    fn recv(&mut self) -> Result<Value> {
+    async fn recv(&mut self) -> Result<Value> {
         let mut buf = String::new();
 
         let mut size: usize = 0;
@@ -118,7 +126,7 @@ impl LspClient {
         // process headers
         loop {
             buf.clear();
-            self.reader.read_line(&mut buf)?;
+            self.reader.read_line(&mut buf).await?;
 
             if buf.trim().is_empty() {
                 break;
@@ -132,21 +140,21 @@ impl LspClient {
 
         let mut response = vec![];
         response.resize(size, 0);
-        self.reader.read_exact(&mut response)?;
+        self.reader.read_exact(&mut response).await?;
 
         let resp = serde_json::from_slice::<Value>(&response)?;
         Ok(resp)
     }
 
-    pub fn request(&mut self, req: jsonrpc::Request) -> Result<Option<jsonrpc::Response>> {
+    pub async fn request(&mut self, req: jsonrpc::Request) -> Result<Option<jsonrpc::Response>> {
         // self.send then read from buffer, skipping notifs and asserting id's are consistent
-        self.send(&req.to_string())?;
+        self.send(&req.to_string()).await?;
 
         match req.id() {
             Some(id) => {
                 // WARNING: this may stall at runtime if we invoke self.recv() and attempt to readline
                 // without hitting an EOF !
-                while let Ok(res) = self.recv() {
+                while let Ok(res) = self.recv().await {
                     let response = serde_json::from_value::<jsonrpc::Response>(res.clone());
                     if response.is_err() {
                         continue;
@@ -168,13 +176,16 @@ impl LspClient {
     }
 }
 
-impl Drop for LspClient {
-    fn drop(&mut self) {
-        self.proc.kill().expect("failed to terminate lsp");
-    }
-}
+// impl Drop for LspClient {
+//     fn drop(&mut self) {
+//         // FIXME: do i need to leak this somehow?
+//         let drop_fut = async move || self.proc.kill().await.expect("failed to terminate lsp");
+//         tokio::spawn(drop_fut());
+//     }
+// }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let file = get_contents("python/nate.py")?;
     dbg!(&file);
 
@@ -182,10 +193,7 @@ fn main() -> Result<()> {
     let py_dir = current_dir().map(|dir| dir.join("python")).unwrap();
     dbg!(&py_dir);
 
-    client.init(py_dir.to_str().unwrap())?;
-
-    // client.open("nate.py").await?.hover().await?;
-    // client.close("nate.py").await?;
+    client.init(py_dir.to_str().unwrap()).await?;
 
     // hover request
     let doc_uri = "file:///Users/nathaniel.nethercott/coding/rust/ty-lsp-subproc/nate.py";
@@ -200,7 +208,7 @@ fn main() -> Result<()> {
         }))
         .finish();
 
-    client.request(did_open)?;
+    client.request(did_open).await?;
 
     let hover = jsonrpc::Request::build("textDocument/references")
         .id(1)
@@ -218,8 +226,10 @@ fn main() -> Result<()> {
         }))
         .finish();
 
-    let resp = client.request(hover)?;
+    let resp = client.request(hover).await?;
     dbg!(resp.unwrap());
+
+    client.proc.kill().await.expect("failed to kill subproc");
 
     Ok(())
 }
