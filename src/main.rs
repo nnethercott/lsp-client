@@ -1,9 +1,14 @@
+use std::io::{self, Read};
 use std::{
+    collections::HashMap,
     env::current_dir,
     fs::File,
-    io::{self, Read},
     path::Path,
     process::{self, Stdio},
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        LazyLock,
+    },
 };
 
 use serde_json::{json, Value};
@@ -12,10 +17,15 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::Mutex,
 };
-use tower_lsp::jsonrpc;
+use tower_lsp::jsonrpc::{self};
 
-// TODO:
-// - handle dispatching/request multiplexing
+static REQUEST_ID: AtomicI64 = AtomicI64::new(0);
+static RESPONSE_REGISTRY: LazyLock<Mutex<HashMap<jsonrpc::Id, jsonrpc::Response>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn next_id() -> i64 {
+    REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 fn get_contents(path: impl AsRef<Path>) -> io::Result<String> {
     let mut contents = String::new();
@@ -31,6 +41,7 @@ enum Error {
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
 
+    #[allow(dead_code)]
     #[error("something happened")]
     Other,
 }
@@ -83,7 +94,7 @@ impl LspClient {
     pub async fn init(&mut self, path: &str) -> Result<()> {
         self.request_or_notify(
             jsonrpc::Request::build("initialize")
-                .id(0)
+                .id(next_id())
                 .params(json!({
                     "processId": process::id(),
                     "rootPath": path,
@@ -125,8 +136,7 @@ impl LspClient {
             }
         }
 
-        let mut response = vec![];
-        response.resize(size, 0);
+        let mut response = vec![0; size];
         stdout_guard.read_exact(&mut response).await?;
 
         drop(stdout_guard);
@@ -139,30 +149,36 @@ impl LspClient {
         &self,
         req: jsonrpc::Request,
     ) -> Result<Option<jsonrpc::Response>> {
-        // self.send then read from buffer, skipping notifs and asserting id's are consistent
         self.send(&req.to_string()).await?;
 
+        // FIXME: here we're aiming for an atomic "read stdout and update global registry"
+        // but its bad since a) worst case everything is inserted in RAM into `RESPONSE_REGISTRY` 
+        // and b) holding the registry mutex guard is blocking.
+        // I don't, however, want to decouple the stdout read from the send op since i feel like
+        // there's a clever way to do this
         match req.id() {
-            Some(id) => {
-                // WARNING: this may stall at runtime if we invoke self.recv() and attempt to readline
-                // without hitting an EOF !
-                while let Ok(res) = self.recv().await {
-                    let response = serde_json::from_value::<jsonrpc::Response>(res.clone());
-                    if response.is_err() {
-                        continue;
-                    }
+            Some(id) => loop {
+                let mut registry_guard = RESPONSE_REGISTRY.lock().await;
 
-                    let parsed = response?;
-
-                    // FIXME: we should actually store these and have a happy path for self.recv
-                    if parsed.id() != id {
-                        return Err(Error::Other);
-                    }
-                    return Ok(Some(parsed));
+                if let Some(value) = registry_guard.remove(id) {
+                    return Ok(Some(value));
                 }
-                unreachable!();
-            }
-            // request was a notif
+
+                let res = self.recv().await?;
+                let response = serde_json::from_value::<jsonrpc::Response>(res);
+                if response.is_err() {
+                    continue;
+                }
+
+                let parsed = response?;
+
+                if parsed.id() != id {
+                    registry_guard.insert(parsed.id().clone(), parsed);
+                    continue;
+                }
+                return Ok(Some(parsed));
+            },
+            // request was a notification
             None => Ok(None),
         }
     }
@@ -170,76 +186,62 @@ impl LspClient {
 
 // impl Drop for LspClient {
 //     fn drop(&mut self) {
-//         // FIXME: do i need to leak this somehow?
+//         // FIXME: do i need to box leak this somehow?
 //         let drop_fut = async move || self.proc.kill().await.expect("failed to terminate lsp");
 //         tokio::spawn(drop_fut());
 //     }
 // }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let file = get_contents("python/nate.py")?;
-    dbg!(&file);
-
     let mut client = LspClient::new(lsp!("ty", "server"))?;
-    let py_dir = current_dir().map(|dir| dir.join("python")).unwrap();
-    dbg!(&py_dir);
 
+    let py_dir = current_dir().map(|dir| dir.join("python")).unwrap();
     client.init(py_dir.to_str().unwrap()).await?;
 
-    // hover request
-    let doc_uri = "file:///Users/nathaniel.nethercott/coding/rust/ty-lsp-subproc/nate.py";
-    let did_open = jsonrpc::Request::build("textDocument/didOpen")
-        .params(json!({
-            "textDocument": {
-                "uri": doc_uri,
-                "languageId": "python",
-                "version": 0,
-                "text": file,
-            }
-        }))
-        .finish();
+    let open_doc = |doc_uri: &str, contents: String| {
+        jsonrpc::Request::build("textDocument/didOpen")
+            .params(json!({
+                "textDocument": {
+                    "uri": doc_uri,
+                    "languageId": "python",
+                    "version": 0,
+                    "text": contents,
+                }
+            }))
+            .finish()
+    };
 
-    client.request_or_notify(did_open).await?;
+    let file = py_dir.join("nate.py");
+    let file_uri = format!("file://{}", file.to_str().unwrap());
+    let contents = get_contents("python/nate.py")?;
 
-    let hover = jsonrpc::Request::build("textDocument/references")
-        .id(1)
-        .params(json!({
-            "textDocument": {
-                "uri": doc_uri,
-            },
-            "position": {
-                "line": 0,
-                "character": 5,
-            },
-            "context": {
-                "includeDeclaration": true,
-            }
-        }))
-        .finish();
+    client
+        .request_or_notify(open_doc(&file_uri, contents))
+        .await?;
 
-    let hover2 = jsonrpc::Request::build("textDocument/references")
-        .id(2)
-        .params(json!({
-            "textDocument": {
-                "uri": doc_uri,
-            },
-            "position": {
-                "line": 4,   // <-- new line
-                "character": 5,
-            },
-            "context": {
-                "includeDeclaration": true,
-            }
-        }))
-        .finish();
+    let ref_factory = |doc_uri: &str, line: usize, char: usize| {
+        jsonrpc::Request::build("textDocument/references")
+            .id(next_id())
+            .params(json!({
+                "textDocument": {
+                    "uri": doc_uri,
+                },
+                "position": {
+                    "line": line,
+                    "character": char,
+                },
+                "context": {
+                    "includeDeclaration": true,
+                }
+            }))
+            .finish()
+    };
 
-    let (resp, resp2) = tokio::join!(
-        client.request_or_notify(hover),
-        client.request_or_notify(hover2)
+    let _res = tokio::join!(
+        client.request_or_notify(ref_factory(&file_uri, 0, 5)),
+        client.request_or_notify(ref_factory(&file_uri, 0, 5)),
     );
-    dbg!(resp);
-    dbg!(resp2);
 
     client.proc.kill().await.expect("failed to kill subproc");
 
