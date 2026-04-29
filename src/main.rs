@@ -157,12 +157,12 @@ struct Driver {
 }
 
 impl Driver {
-    pub fn new(server: LspServer, rx: Receiver<Action>) -> Self {
-        Self {
-            server,
+    pub fn new(lsp: Lsp, rx: Receiver<Action>) -> Result<Self> {
+        Ok(Self {
+            server: LspServer::new(lsp)?,
             incoming: rx,
             sendback_channels: HashMap::new(),
-        }
+        })
     }
 
     async fn enqueue(&mut self) -> Result<()> {
@@ -232,7 +232,6 @@ impl LspClient {
     pub async fn request(&self, req: jsonrpc::Request) -> Result<jsonrpc::Response> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let act = Action::Request { req, tx };
-
         self.0.send(act).await.map_err(|_| Error::Tokio)?;
         rx.await.map_err(|_| Error::Tokio)
     }
@@ -259,72 +258,77 @@ async fn serve(instance: &mut Driver) -> Result<()> {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+fn get_server_client() -> Result<(Driver, LspClient)> {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
 
-    let actor = async move || {
-        let server = LspServer::new(lsp!("ty", "server"))?;
-        let mut driver = Driver::new(server, rx);
-        serve(&mut driver).await?;
-        Ok::<(), Error>(())
+    let driver = Driver::new(lsp!("ty", "server"), rx)?;
+    let client = LspClient(tx);
+
+    Ok((driver, client))
+}
+
+// the main application logic
+async fn silly(client: LspClient) -> Result<()> {
+    let py_dir = current_dir().map(|dir| dir.join("python")).unwrap();
+    client.init(py_dir.to_str().unwrap()).await?;
+
+    let open_doc = |doc_uri: &str, contents: String| {
+        jsonrpc::Request::build("textDocument/didOpen")
+            .params(json!({
+                "textDocument": {
+                    "uri": doc_uri,
+                    "languageId": "python",
+                    "version": 0,
+                    "text": contents,
+                }
+            }))
+            .finish()
     };
 
-    let driver = async || {
-        let client = LspClient(tx);
+    let file = py_dir.join("nate.py");
+    let file_uri = format!("file://{}", file.to_str().unwrap());
+    let contents = get_contents("python/nate.py")?;
 
-        let py_dir = current_dir().map(|dir| dir.join("python")).unwrap();
-        dbg!(&py_dir);
-        client.init(py_dir.to_str().unwrap()).await?;
+    client.notify(open_doc(&file_uri, contents)).await?;
 
-        let open_doc = |doc_uri: &str, contents: String| {
-            jsonrpc::Request::build("textDocument/didOpen")
-                .params(json!({
-                    "textDocument": {
-                        "uri": doc_uri,
-                        "languageId": "python",
-                        "version": 0,
-                        "text": contents,
-                    }
-                }))
-                .finish()
-        };
+    let ref_factory = |doc_uri: &str, line: usize, char: usize| {
+        jsonrpc::Request::build("textDocument/references")
+            .id(next_id())
+            .params(json!({
+                "textDocument": {
+                    "uri": doc_uri,
+                },
+                "position": {
+                    "line": line,
+                    "character": char,
+                },
+                "context": {
+                    "includeDeclaration": true,
+                }
+            }))
+            .finish()
+    };
 
-        let file = py_dir.join("nate.py");
-        let file_uri = format!("file://{}", file.to_str().unwrap());
-        let contents = get_contents("python/nate.py")?;
+    let res = tokio::join!(
+        client.request(ref_factory(&file_uri, 0, 5)),
+        client.request(ref_factory(&file_uri, 0, 5)),
+    );
+    let _ = dbg!(res);
+    Ok::<(), Error>(())
+}
 
-        client.notify(open_doc(&file_uri, contents)).await?;
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
+    let (mut lsp, client) = get_server_client()?;
 
-        let ref_factory = |doc_uri: &str, line: usize, char: usize| {
-            jsonrpc::Request::build("textDocument/references")
-                .id(next_id())
-                .params(json!({
-                    "textDocument": {
-                        "uri": doc_uri,
-                    },
-                    "position": {
-                        "line": line,
-                        "character": char,
-                    },
-                    "context": {
-                        "includeDeclaration": true,
-                    }
-                }))
-                .finish()
-        };
-
-        let res = tokio::join!(
-            client.request(ref_factory(&file_uri, 0, 5)),
-            client.request(ref_factory(&file_uri, 0, 5)),
-        );
-        let _ = dbg!(res);
+    let mut actor = async move || {
+        serve(&mut lsp).await?;
         Ok::<(), Error>(())
     };
 
     tokio::select! {
+        _ = silly(client) => (),
         _ = actor() => (),
-        _ = driver() => (),
     }
 
     Ok(())
