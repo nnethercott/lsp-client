@@ -163,7 +163,7 @@ impl Driver {
                     let id = req.id().unwrap();
                     let _ = self.sendback_channels.insert(id.clone(), tx);
 
-                    self.server.write_one(&msg).await.inspect_err(|e| {
+                    self.server.write_one(&msg).await.inspect_err(|_| {
                         let _ = self.sendback_channels.remove(id);
                     })?
                 }

@@ -5,7 +5,7 @@ use std::{
     path::Path,
 };
 
-use lsp_client::{Driver, Error, LspClient, LspCmd, Result, next_id, serve};
+use pspsps::{Driver, Error, LspClient, LspCmd, Result, next_id, serve};
 use serde_json::json;
 use tower_lsp::jsonrpc;
 
